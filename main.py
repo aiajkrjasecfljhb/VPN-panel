@@ -1188,25 +1188,25 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     return {"ok": True, "deleted": uid}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay — (نیاز به فایل relay_vless.py)
+# VLESS Relay
 # ══════════════════════════════════════════════════════════════════════════════
 
-# from relay_vless import (
-#     RELAY_BUF,
-#     parse_vless_header,
-#     check_and_use,
-#     relay_ws_to_tcp,
-#     relay_tcp_to_ws,
-#     websocket_tunnel,
-# )
-# app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
+from relay_vless import (
+    RELAY_BUF,
+    parse_vless_header,
+    check_and_use,
+    relay_ws_to_tcp,
+    relay_tcp_to_ws,
+    websocket_tunnel,
+)
+app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# XHTTP — (نیاز به فایل xhttp_siz10.py)
+# XHTTP
 # ══════════════════════════════════════════════════════════════════════════════
 
-# from xhttp_siz10 import router as xhttp_router
-# app.include_router(xhttp_router)
+from xhttp_siz10 import router as xhttp_router
+app.include_router(xhttp_router)
 
 # ── HTTP Proxy ────────────────────────────────────────────────────────────────
 _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
