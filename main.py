@@ -354,7 +354,7 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "X4G", "version": "9.1", "status": "active", "channel": "https://t.me/Farajian2004f"}
+    return {"status":) "khayberpanel!"}
 
 @app.get("/health")
 async def health():
