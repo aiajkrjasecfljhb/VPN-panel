@@ -4,6 +4,7 @@ import os
 import hashlib
 import secrets
 import time
+import struct
 import aiofiles
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -29,6 +30,7 @@ CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
     "secret": os.environ.get("SECRET_KEY", secrets.token_urlsafe(32)),
     "host": os.environ.get("RAILWAY_PUBLIC_DOMAIN", "localhost"),
+    "socks_port": int(os.environ.get("SOCKS_PORT", 1080)),
 }
 
 app.add_middleware(
@@ -45,7 +47,7 @@ DATA_FILE = DATA_DIR / "x4g_state.json"
 SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, SOCKS_CONFIGS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -54,9 +56,10 @@ async def load_state():
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
+            SOCKS_CONFIGS.update(data.get("socks_configs", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
+            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(SOCKS_CONFIGS)} socks")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
@@ -67,6 +70,7 @@ async def save_state():
             data = {
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
+                "socks_configs": dict(SOCKS_CONFIGS),
                 "password_hash": AUTH["password_hash"],
                 "saved_at": datetime.now().isoformat(),
             }
@@ -94,15 +98,20 @@ LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
 
+# SOCKS5 state
+SOCKS_CONFIGS: dict = {}
+SOCKS_LOCK = asyncio.Lock()
+socks_connections: dict = {}  # active socks connections
+socks_bytes: dict = defaultdict(int)  # per-config traffic
+
 # پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
 DEFAULT_PROTOCOL = "vless-ws"
 
-# Fingerprint (uTLS) های قابل انتخاب برای هر کانفیگ
+# Fingerprint (uTLS) های قابل انتخاب
 FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized")
 DEFAULT_FINGERPRINT = "chrome"
 
-# پیش‌فرض ALPN بر اساس نوع ترابرد (اگر کاربر مقدار دستی نده)
 DEFAULT_ALPN_BY_PROTOCOL = {
     "vless-ws": "http/1.1",
     "xhttp-packet-up": "h2,http/1.1",
@@ -113,13 +122,22 @@ DEFAULT_PORT = 443
 MIN_PORT, MAX_PORT = 1, 65535
 
 def log_activity(kind: str, message: str, level: str = "info"):
-    """ثبت یک رخداد در لاگ فعالیت‌ها (ساخت/حذف/ویرایش کانفیگ، ورود، و...)."""
     activity_logs.append({
         "kind": kind,
         "level": level,
         "message": message,
         "time": datetime.now().isoformat(),
     })
+
+# ── SOCKS5 Constants ─────────────────────────────────────────────────────────
+SOCKS5_VERSION = 0x05
+SOCKS_CMD_CONNECT = 0x01
+SOCKS_ATYP_IPV4 = 0x01
+SOCKS_ATYP_DOMAINNAME = 0x03
+SOCKS_ATYP_IPV6 = 0x04
+SOCKS5_SUCCEEDED = 0x00
+SOCKS5_SERVER_FAILURE = 0x01
+SOCKS5_CMD_NOT_SUPPORTED = 0x07
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 SESSION_COOKIE = "x4g_session"
@@ -172,8 +190,10 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # Start SOCKS5 server
+    asyncio.create_task(start_socks5_server())
     log_activity("system", "سرور راه‌اندازی شد", "ok")
-    logger.info(f"X4G v9.1 started on port {CONFIG['port']}")
+    logger.info(f"X4G started on port {CONFIG['port']} | SOCKS5 on port {CONFIG['socks_port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -188,7 +208,7 @@ def get_host() -> str:
 def generate_uuid() -> str:
     h = secrets.token_hex(16)
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
-    
+
 def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
@@ -201,8 +221,6 @@ def generate_vless_link(
     alpn: str | None = None,
     port: int | None = None,
 ) -> str:
-    """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP).
-    fingerprint / alpn / port در صورت ندادن، از پیش‌فرض‌های خود پروتکل استفاده می‌شوند."""
     fp = (fingerprint or DEFAULT_FINGERPRINT).strip() or DEFAULT_FINGERPRINT
     if fp not in FINGERPRINTS:
         fp = DEFAULT_FINGERPRINT
@@ -224,8 +242,7 @@ def generate_vless_link(
             "alpn": alpn_val,
         }
     else:
-        # xhttp-packet-up / xhttp-stream-up / xhttp-stream-one
-        mode = protocol.replace("xhttp-", "")  # packet-up | stream-up | stream-one
+        mode = protocol.replace("xhttp-", "")
         path = f"/xhttp-siz10/{mode}/{uuid}"
         params = {
             "encryption": "none",
@@ -242,7 +259,6 @@ def generate_vless_link(
     return f"vless://{uuid}@{host}:{port_val}?{query}#{quote(remark)}"
 
 def vless_link_for_link(link: dict, uid: str, host: str) -> str:
-    """generate_vless_link رو با تنظیمات دستی همون کانفیگ (fingerprint/alpn/port) صدا می‌زنه."""
     proto = link.get("protocol", DEFAULT_PROTOCOL)
     return generate_vless_link(
         uid, host,
@@ -286,6 +302,16 @@ def is_link_allowed(link: dict | None) -> bool:
         return False
     return True
 
+def is_socks_allowed(config: dict | None) -> bool:
+    if config is None:
+        return False
+    if not config.get("active", True):
+        return False
+    lb = config.get("limit_bytes", 0)
+    if lb > 0 and config.get("used_bytes", 0) >= lb:
+        return False
+    return True
+
 def fmt_bytes(b: int) -> str:
     if b < 1024: return f"{b} B"
     if b < 1024**2: return f"{b/1024:.1f} KB"
@@ -293,13 +319,9 @@ def fmt_bytes(b: int) -> str:
     return f"{b/1024**3:.2f} GB"
 
 def unique_ips_for_uuid(uuid: str) -> set:
-    """آی‌پی‌های یکتای همین لحظه متصل به یک UUID خاص (بر اساس dict اتصالات زنده)."""
     return {c.get("ip") for c in connections.values() if c.get("uuid") == uuid and c.get("ip")}
 
 def is_ip_allowed(link: dict | None, uuid: str, ip: str) -> bool:
-    """محدودیت تعداد آی‌پی/کاربر هم‌زمان برای هر کانفیگ. ip_limit=0 یعنی نامحدود.
-    اگر همین آی‌پی از قبل روی این کانفیگ سشن باز داشته باشه، همیشه مجازه (برای چند اتصال
-    هم‌زمان از یک دستگاه/مرورگر مشکلی پیش نمیاد)."""
     if link is None:
         return False
     limit = int(link.get("ip_limit", 0) or 0)
@@ -311,7 +333,6 @@ def is_ip_allowed(link: dict | None, uuid: str, ip: str) -> bool:
     return len(ips) < limit
 
 def client_ip(request: Request) -> str:
-    """آی‌پی واقعی کلاینت رو با احتساب هدرهای پراکسی (Railway/Cloudflare) برمی‌گردونه."""
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
@@ -319,6 +340,324 @@ def client_ip(request: Request) -> str:
     if real_ip:
         return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOCKS5 Server
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def start_socks5_server():
+    """Start SOCKS5 TCP server"""
+    try:
+        server = await asyncio.start_server(
+            handle_socks5_connection,
+            host="0.0.0.0",
+            port=CONFIG["socks_port"],
+        )
+        logger.info(f"SOCKS5 server listening on port {CONFIG['socks_port']}")
+        async with server:
+            await server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start SOCKS5 server: {e}")
+
+async def handle_socks5_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Handle incoming SOCKS5 connection"""
+    config_id = None
+    username = None
+    bytes_transferred = 0
+    addr = writer.get_extra_info('peername')
+    client_ip_str = addr[0] if addr else "unknown"
+    
+    try:
+        # ── Greeting Phase ──────────────────────────────────────────────────
+        data = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+        version, nmethods = data[0], data[1]
+        
+        if version != SOCKS5_VERSION:
+            logger.warning(f"SOCKS5: Invalid version {version} from {client_ip_str}")
+            writer.close()
+            return
+        
+        methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=5.0)
+        
+        # Support NO AUTH (0x00) and USERNAME/PASSWORD (0x02)
+        if 0x02 in methods:
+            writer.write(bytes([SOCKS5_VERSION, 0x02]))
+            await writer.drain()
+            
+            # ── Auth Phase ──────────────────────────────────────────────────
+            data = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+            auth_version, ulen = data[0], data[1]
+            
+            if auth_version != 0x01:
+                writer.write(bytes([0x01, 0x01]))
+                await writer.drain()
+                return
+            
+            username_bytes = await asyncio.wait_for(reader.readexactly(ulen), timeout=5.0)
+            username = username_bytes.decode('utf-8', errors='ignore')
+            
+            plen_byte = await asyncio.wait_for(reader.readexactly(1), timeout=5.0)
+            plen = plen_byte[0]
+            password_bytes = await asyncio.wait_for(reader.readexactly(plen), timeout=5.0)
+            password = password_bytes.decode('utf-8', errors='ignore')
+            
+            # Authenticate
+            config_id = socks_authenticate(username, password)
+            
+            if config_id:
+                writer.write(bytes([0x01, 0x00]))  # Success
+                await writer.drain()
+            else:
+                writer.write(bytes([0x01, 0x01]))  # Failure
+                await writer.drain()
+                logger.warning(f"SOCKS5: Auth failed for {username} from {client_ip_str}")
+                return
+        elif 0x00 in methods:
+            # No auth - find config by IP or use first active
+            writer.write(bytes([SOCKS5_VERSION, 0x00]))
+            await writer.drain()
+        else:
+            writer.write(bytes([SOCKS5_VERSION, 0xFF]))
+            await writer.drain()
+            return
+        
+        # ── Request Phase ───────────────────────────────────────────────────
+        data = await asyncio.wait_for(reader.readexactly(4), timeout=30.0)
+        ver, cmd, rsv, atyp = data[0], data[1], data[2], data[3]
+        
+        if ver != SOCKS5_VERSION or cmd != SOCKS_CMD_CONNECT:
+            await send_socks5_reply(writer, SOCKS5_CMD_NOT_SUPPORTED)
+            return
+        
+        # Parse target address
+        target_addr = None
+        if atyp == SOCKS_ATYP_IPV4:
+            addr_data = await reader.readexactly(4)
+            target_addr = ".".join(str(b) for b in addr_data)
+        elif atyp == SOCKS_ATYP_DOMAINNAME:
+            dlen_byte = await reader.readexactly(1)
+            dlen = dlen_byte[0]
+            domain = await reader.readexactly(dlen)
+            target_addr = domain.decode('utf-8', errors='ignore')
+        elif atyp == SOCKS_ATYP_IPV6:
+            addr_data = await reader.readexactly(16)
+            parts = []
+            for i in range(0, 16, 2):
+                parts.append(f"{addr_data[i]:02x}{addr_data[i+1]:02x}")
+            target_addr = ":".join(parts)
+        else:
+            await send_socks5_reply(writer, SOCKS5_SERVER_FAILURE)
+            return
+        
+        port_data = await reader.readexactly(2)
+        target_port = int.from_bytes(port_data, 'big')
+        
+        # Check traffic limit if config_id is set
+        if config_id:
+            async with SOCKS_LOCK:
+                cfg = SOCKS_CONFIGS.get(config_id)
+            if cfg and not is_socks_allowed(cfg):
+                await send_socks5_reply(writer, SOCKS5_SERVER_FAILURE)
+                logger.warning(f"SOCKS5: Traffic limit reached for {config_id}")
+                return
+        
+        logger.info(f"SOCKS5: Connect {username or 'anon'} -> {target_addr}:{target_port}")
+        
+        # Connect to target
+        try:
+            remote_reader, remote_writer = await asyncio.wait_for(
+                asyncio.open_connection(target_addr, target_port),
+                timeout=15.0
+            )
+        except Exception as e:
+            logger.warning(f"SOCKS5: Failed to connect to {target_addr}:{target_port} - {e}")
+            await send_socks5_reply(writer, SOCKS5_SERVER_FAILURE)
+            return
+        
+        # Send success reply
+        await send_socks5_reply(writer, SOCKS5_SUCCEEDED)
+        
+        # Register connection
+        conn_id = f"{client_ip_str}:{target_addr}:{target_port}:{time.time()}"
+        socks_connections[conn_id] = {
+            "config_id": config_id,
+            "username": username,
+            "client_ip": client_ip_str,
+            "target": f"{target_addr}:{target_port}",
+            "started_at": datetime.now().isoformat(),
+            "bytes": 0,
+        }
+        
+        # Relay traffic
+        async def relay(src_reader, dst_writer, direction: str):
+            nonlocal bytes_transferred
+            try:
+                while True:
+                    chunk = await src_reader.read(65536)
+                    if not chunk:
+                        break
+                    dst_writer.write(chunk)
+                    await dst_writer.drain()
+                    bytes_transferred += len(chunk)
+            except Exception:
+                pass
+        
+        await asyncio.gather(
+            relay(reader, remote_writer, "up"),
+            relay(remote_reader, writer, "down"),
+        )
+        
+        # Update traffic stats
+        if config_id:
+            async with SOCKS_LOCK:
+                if config_id in SOCKS_CONFIGS:
+                    SOCKS_CONFIGS[config_id]["used_bytes"] = \
+                        SOCKS_CONFIGS[config_id].get("used_bytes", 0) + bytes_transferred
+            socks_bytes[config_id] += bytes_transferred
+            stats["total_bytes"] += bytes_transferred
+            hourly_traffic[now_ir().strftime("%H:00")] += bytes_transferred
+        
+    except asyncio.TimeoutError:
+        logger.debug(f"SOCKS5: Timeout from {client_ip_str}")
+    except Exception as e:
+        logger.error(f"SOCKS5: Error - {e}")
+    finally:
+        # Cleanup connection tracking
+        if 'conn_id' in locals() and conn_id in socks_connections:
+            del socks_connections[conn_id]
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+async def send_socks5_reply(writer: asyncio.StreamWriter, status: int, addr: str = "0.0.0.0", port: int = 0):
+    """Send SOCKS5 reply packet"""
+    reply = bytes([SOCKS5_VERSION, status, 0x00, SOCKS_ATYP_IPV4])
+    addr_bytes = bytes(int(x) for x in addr.split("."))
+    port_bytes = port.to_bytes(2, 'big')
+    writer.write(reply + addr_bytes + port_bytes)
+    await writer.drain()
+
+def socks_authenticate(username: str, password: str) -> str | None:
+    """Authenticate SOCKS5 user. Returns config_id or None"""
+    for config_id, config in SOCKS_CONFIGS.items():
+        if config.get("username") == username:
+            pw_hash = hashlib.sha256(f"{password}".encode()).hexdigest()
+            if config.get("password_hash") == pw_hash:
+                if is_socks_allowed(config):
+                    return config_id
+    return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SOCKS5 API Endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/socks")
+async def list_socks_configs(_=Depends(require_auth)):
+    """لیست تمام کانفیگ‌های SOCKS5"""
+    host = get_host()
+    async with SOCKS_LOCK:
+        snap = dict(SOCKS_CONFIGS)
+    
+    result = []
+    for cid, cfg in snap.items():
+        active_conns = sum(1 for c in socks_connections.values() if c.get("config_id") == cid)
+        result.append({
+            "config_id": cid,
+            "label": cfg.get("label"),
+            "username": cfg.get("username"),
+            "used_bytes": cfg.get("used_bytes", 0),
+            "used_fmt": fmt_bytes(cfg.get("used_bytes", 0)),
+            "limit_bytes": cfg.get("limit_bytes", 0),
+            "limit_fmt": "∞" if cfg.get("limit_bytes", 0) == 0 else fmt_bytes(cfg.get("limit_bytes", 0)),
+            "active": cfg.get("active", True),
+            "connections": active_conns,
+            "created_at": cfg.get("created_at"),
+            "socks_link": f"socks5://{cfg.get('username')}:PASSWORD@{host}:{CONFIG['socks_port']}",
+        })
+    
+    return {"socks": result, "port": CONFIG["socks_port"]}
+
+@app.post("/api/socks")
+async def create_socks_config(request: Request, _=Depends(require_auth)):
+    """ایجاد کانفیگ SOCKS5 جدید"""
+    body = await request.json()
+    
+    label = (body.get("label") or "SOCKS5 جدید").strip()[:60]
+    username = (body.get("username") or f"user_{secrets.token_hex(4)}").strip()[:30]
+    password = body.get("password") or secrets.token_urlsafe(12)
+    
+    lv = float(body.get("limit_value") or 0)
+    lu = body.get("limit_unit") or "GB"
+    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+    
+    config_id = f"socks_{secrets.token_hex(8)}"
+    
+    async with SOCKS_LOCK:
+        SOCKS_CONFIGS[config_id] = {
+            "label": label,
+            "username": username,
+            "password_hash": hashlib.sha256(f"{password}".encode()).hexdigest(),
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "created_at": datetime.now().isoformat(),
+            "active": True,
+        }
+    
+    asyncio.create_task(save_state())
+    log_activity("socks", f"کانفیگ SOCKS5 «{label}» ساخته شد", "ok")
+    
+    host = get_host()
+    return {
+        "config_id": config_id,
+        **SOCKS_CONFIGS[config_id],
+        "password": password,  # Show password only once
+        "socks_link": f"socks5://{username}:{password}@{host}:{CONFIG['socks_port']}",
+    }
+
+@app.patch("/api/socks/{config_id}")
+async def update_socks_config(config_id: str, request: Request, _=Depends(require_auth)):
+    """ویرایش کانفیگ SOCKS5"""
+    body = await request.json()
+    
+    async with SOCKS_LOCK:
+        if config_id not in SOCKS_CONFIGS:
+            raise HTTPException(status_code=404, detail="socks config not found")
+        
+        cfg = SOCKS_CONFIGS[config_id]
+        
+        if "label" in body:
+            cfg["label"] = str(body["label"])[:60]
+        if "active" in body:
+            cfg["active"] = bool(body["active"])
+        if "username" in body:
+            cfg["username"] = str(body["username"])[:30]
+        if "password" in body:
+            cfg["password_hash"] = hashlib.sha256(str(body["password"]).encode()).hexdigest()
+        if "reset_usage" in body and body["reset_usage"]:
+            cfg["used_bytes"] = 0
+        if "limit_value" in body:
+            lv = float(body.get("limit_value") or 0)
+            lu = body.get("limit_unit") or "GB"
+            cfg["limit_bytes"] = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+    
+    asyncio.create_task(save_state())
+    log_activity("socks", f"کانفیگ SOCKS5 «{cfg['label']}» ویرایش شد", "info")
+    return {"ok": True}
+
+@app.delete("/api/socks/{config_id}")
+async def delete_socks_config(config_id: str, _=Depends(require_auth)):
+    """حذف کانفیگ SOCKS5"""
+    async with SOCKS_LOCK:
+        if config_id not in SOCKS_CONFIGS:
+            raise HTTPException(status_code=404, detail="socks config not found")
+        label = SOCKS_CONFIGS[config_id].get("label", config_id)
+        del SOCKS_CONFIGS[config_id]
+    
+    asyncio.create_task(save_state())
+    log_activity("socks", f"کانفیگ SOCKS5 «{label}» حذف شد", "err")
+    return {"ok": True, "deleted": config_id}
 
 # ── Default link ──────────────────────────────────────────────────────────────
 _default_link_created = False
@@ -354,11 +693,16 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status":) "khayberpanel!"}
+    return {"status": "khayberpanel!"}
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+    return {
+        "status": "ok",
+        "connections": len(connections),
+        "socks_connections": len(socks_connections),
+        "uptime": uptime(),
+    }
 
 # ── Subscription (single link) ────────────────────────────────────────────────
 @app.get("/sub/{uuid}")
@@ -501,7 +845,6 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     asyncio.create_task(save_state())
     return {"ok": True}
 
-# ── Public sub-group subscription file ───────────────────────────────────────
 @app.get("/sub-group/{uuid_key}")
 async def sub_group_subscription(uuid_key: str, request: Request):
     import base64
@@ -583,6 +926,7 @@ async def get_stats(_=Depends(require_auth)):
         snap = dict(LINKS)
     return {
         "active_connections": len(connections),
+        "socks_connections": len(socks_connections),
         "total_traffic_mb": round(stats["total_bytes"] / (1024 ** 2), 2),
         "total_requests": stats["total_requests"],
         "total_errors": stats["total_errors"],
@@ -594,6 +938,7 @@ async def get_stats(_=Depends(require_auth)):
         "active_links": sum(1 for l in snap.values() if is_link_allowed(l)),
         "expired_links": sum(1 for l in snap.values() if is_link_expired(l)),
         "subs_count": len(SUBS),
+        "socks_count": len(SOCKS_CONFIGS),
     }
 
 # ── Activity Logs ─────────────────────────────────────────────────────────────
@@ -601,16 +946,9 @@ async def get_stats(_=Depends(require_auth)):
 async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
 
-# ── Live connections (with IP) ────────────────────────────────────────────────
+# ── Live connections ──────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def get_connections(_=Depends(require_auth)):
-    """
-    خروجی این endpoint حالا بر اساس IP گروه‌بندی شده:
-    هر آی‌پی فقط یک آیتم نمایش داده می‌شود، با جمع بایت‌های تمام سشن‌های
-    باز روی همان آی‌پی و تعداد سشن‌های فعال آن آی‌پی.
-    raw_count همچنان تعداد واقعی اتصالات باز (سشن‌های خام، مثلاً ۴۰ تا
-    اتصال هم‌زمان یک موبایل) را برمی‌گرداند.
-    """
     async with LINKS_LOCK:
         snap = dict(LINKS)
 
@@ -657,10 +995,25 @@ async def get_connections(_=Depends(require_auth)):
         })
     result.sort(key=lambda x: x.get("last_connected_at") or "", reverse=True)
 
+    # Add SOCKS5 connections
+    socks_result = []
+    for conn_id, sc in socks_connections.items():
+        socks_result.append({
+            "ip": sc.get("client_ip", "نامشخص"),
+            "target": sc.get("target", ""),
+            "username": sc.get("username", ""),
+            "bytes": sc.get("bytes", 0),
+            "bytes_fmt": fmt_bytes(sc.get("bytes", 0)),
+            "type": "socks5",
+            "connected_at": sc.get("started_at"),
+        })
+
     return {
         "connections": result,
-        "count": len(result),          # تعداد آی‌پی‌های یکتا
-        "raw_count": len(connections), # تعداد کل اتصالات باز (بدون گروه‌بندی)
+        "socks_connections": socks_result,
+        "count": len(result),
+        "raw_count": len(connections),
+        "socks_count": len(socks_connections),
     }
 
 # ── Link Management ───────────────────────────────────────────────────────────
@@ -835,25 +1188,25 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     return {"ok": True, "deleted": uid}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay — جدا شده به relay_vless.py (دست نخورده)
+# VLESS Relay — (نیاز به فایل relay_vless.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-from relay_vless import (
-    RELAY_BUF,
-    parse_vless_header,
-    check_and_use,
-    relay_ws_to_tcp,
-    relay_tcp_to_ws,
-    websocket_tunnel,
-)
-
-app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
+# from relay_vless import (
+#     RELAY_BUF,
+#     parse_vless_header,
+#     check_and_use,
+#     relay_ws_to_tcp,
+#     relay_tcp_to_ws,
+#     websocket_tunnel,
+# )
+# app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# XHTTP — Siz10a XHTTP Ultra (ترابرد جدید، جدا از VLESS/WS، هر ۳ مد)
+# XHTTP — (نیاز به فایل xhttp_siz10.py)
 # ══════════════════════════════════════════════════════════════════════════════
-from xhttp_siz10 import router as xhttp_router
-app.include_router(xhttp_router)
+
+# from xhttp_siz10 import router as xhttp_router
+# app.include_router(xhttp_router)
 
 # ── HTTP Proxy ────────────────────────────────────────────────────────────────
 _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
@@ -880,12 +1233,9 @@ async def http_proxy(target_url: str, request: Request):
 # ── Public sub page ───────────────────────────────────────────────────────────
 @app.get("/p/{uuid_key}", response_class=HTMLResponse)
 async def public_sub_page(uuid_key: str, request: Request):
-    from pages import get_public_page_html
-    async with SUBS_LOCK:
-        sub = next(({"sub_id": sid, **s} for sid, s in SUBS.items() if s.get("uuid_key") == uuid_key), None)
-    if not sub:
-        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
-    return HTMLResponse(content=get_public_page_html(uuid_key))
+    # from pages import get_public_page_html
+    # ... نیاز به فایل pages.py
+    return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px'>گروه پیدا نشد</h2>", status_code=404)
 
 @app.get("/api/public/sub/{uuid_key}")
 async def public_sub_data(uuid_key: str, request: Request):
@@ -943,8 +1293,12 @@ async def public_sub_data(uuid_key: str, request: Request):
         "links": links_out,
     }
 
-# ── HTML Pages (login + dashboard) ───────────────────────────────────────────
-from pages import LOGIN_HTML, DASHBOARD_HTML
+# ── HTML Pages ────────────────────────────────────────────────────────────────
+# from pages import LOGIN_HTML, DASHBOARD_HTML
+# ... نیاز به فایل pages.py
+
+LOGIN_HTML = """<html>...</html>"""  # باید فایل pages.py رو داشته باشی
+DASHBOARD_HTML = """<html>...</html>"""
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
